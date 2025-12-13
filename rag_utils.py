@@ -1,215 +1,299 @@
 import os
+import hashlib
+import logging
+from typing import Optional, List, Dict, Any
+
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 import google.generativeai as genai
-from google.generativeai import embed_content
 from pinecone import Pinecone, ServerlessSpec
 
-# Charger les variables d’environnement
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# -------------------------
+# Env
+# -------------------------
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-INDEX_NAME = "agro-index"
+INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "agro-index")
+DATA_DIR = os.getenv("DATA_DIR", "data")
 
-# Configurer Gemini
+# -------------------------
+# Gemini (generation only)
+# -------------------------
+if not GOOGLE_API_KEY:
+    raise ValueError("Missing GOOGLE_API_KEY in environment variables (.env)")
+
 genai.configure(api_key=GOOGLE_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+llm = genai.GenerativeModel("gemini-2.5-flash")
 
-# Initialiser Pinecone
+# -------------------------
+# Local HF Embeddings (free)
+# -------------------------
+_LOCAL_EMB_MODEL = None
+_LOCAL_EMB_DIM: Optional[int] = None
+
+HF_EMB_MODEL_NAME = os.getenv(
+    "HF_EMB_MODEL_NAME",
+    "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"  # 768 dim, multilingual
+)
+
+def _ensure_local_model() -> bool:
+    global _LOCAL_EMB_MODEL, _LOCAL_EMB_DIM
+    if _LOCAL_EMB_MODEL is not None:
+        return True
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(HF_EMB_MODEL_NAME)
+        _LOCAL_EMB_MODEL = model
+        _LOCAL_EMB_DIM = len(model.encode("test"))
+        logger.info("Loaded local embedding model: %s (dim=%s)", HF_EMB_MODEL_NAME, _LOCAL_EMB_DIM)
+        return True
+    except Exception as e:
+        logger.exception("Failed to load SentenceTransformer model: %s", e)
+        _LOCAL_EMB_MODEL = None
+        _LOCAL_EMB_DIM = None
+        return False
+
+def generate_embedding(text: str) -> Optional[List[float]]:
+    """Return normalized embedding vector (list[float]) from local HF model."""
+    if not isinstance(text, str):
+        # In case caller passes a Document by mistake
+        text = getattr(text, "page_content", None) or str(text)
+
+    if not _ensure_local_model():
+        return None
+
+    try:
+        emb = _LOCAL_EMB_MODEL.encode(text, normalize_embeddings=True)
+        return emb.tolist() if hasattr(emb, "tolist") else list(emb)
+    except Exception as e:
+        logger.exception("Local embedding failed: %s", e)
+        return None
+
+# -------------------------
+# Pinecone
+# -------------------------
+if not PINECONE_API_KEY:
+    raise ValueError("Missing PINECONE_API_KEY in environment variables (.env)")
+
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
-# Créer l’index si inexistant
+# Make sure embedding model is available so we know dimension
+if not _ensure_local_model():
+    raise RuntimeError(
+        "SentenceTransformers is not available. Install it:\n"
+        "  pip install -U sentence-transformers torch\n"
+    )
+
+# Ensure dimension matches your Pinecone index
+EMB_DIM = _LOCAL_EMB_DIM
+if EMB_DIM != 768:
+    raise RuntimeError(
+        f"Embedding dimension mismatch: got {EMB_DIM}. "
+        "Use a 768-dim model (e.g. paraphrase-multilingual-mpnet-base-v2 / all-mpnet-base-v2)."
+    )
+
+# Create index if missing
 if INDEX_NAME not in pc.list_indexes().names():
+    logger.info("Creating Pinecone index %s (dim=%s)", INDEX_NAME, EMB_DIM)
     pc.create_index(
         name=INDEX_NAME,
-        dimension=768,
+        dimension=EMB_DIM,
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
 
 index = pc.Index(INDEX_NAME)
 
-DATA_DIR = "data"
-
-def load_documents():
+# -------------------------
+# PDF Load + Chunk
+# -------------------------
+def load_documents() -> List[Dict[str, Any]]:
+    """
+    Returns list of dict items:
+      { "source": filename, "page": page_number, "text": extracted_text }
+    """
     docs = []
+    if not os.path.isdir(DATA_DIR):
+        raise FileNotFoundError(f"DATA_DIR not found: {DATA_DIR}")
+
     for filename in os.listdir(DATA_DIR):
-        if filename.endswith(".pdf"):
-            path = os.path.join(DATA_DIR, filename)
+        if not filename.lower().endswith(".pdf"):
+            continue
+
+        path = os.path.join(DATA_DIR, filename)
+        try:
             reader = PdfReader(path)
-            text = ""
-            for page in reader.pages:
-                text += page.extract_text() or ""
-            docs.append(text)
+        except Exception as e:
+            logger.warning("Failed to read PDF %s: %s", filename, e)
+            continue
+
+        for page_idx, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            text = text.strip()
+            if not text:
+                continue
+            docs.append({
+                "source": filename,
+                "page": page_idx + 1,  # human-readable
+                "text": text
+            })
+
+    logger.info("Loaded %s pages of text from PDFs in %s", len(docs), DATA_DIR)
     return docs
 
-def chunk_documents(texts):
+def chunk_documents(pages: List[Dict[str, Any]]):
+    """
+    Returns list of LangChain Document objects with metadata.
+    """
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    docs = []
-    for text in texts:
-        chunks = splitter.create_documents([text])
-        docs.extend(chunks)
-    return docs
-
-def generate_embedding(text):
-    response = embed_content(
-        model="models/embedding-001",
-        content=text,
-        task_type="retrieval_document"
-    )
-    return response["embedding"]
-
-def index_documents(chunks):
-    for i, chunk in enumerate(chunks):
-        vector = generate_embedding(chunk)
-        index.upsert(vectors=[{
-            "id": f"doc-{i}",
-            "values": vector,
-            "metadata": {"text": chunk}
+    chunks = []
+    for p in pages:
+        # Create Documents from the page text
+        docs = splitter.create_documents([p["text"]], metadatas=[{
+            "source": p["source"],
+            "page": p["page"]
         }])
-    print(f"✅ {len(chunks)} chunks indexés dans Pinecone.")
+        chunks.extend(docs)
+    logger.info("Created %s chunks", len(chunks))
+    return chunks
 
-def get_answer(query):
-    query_vector = generate_embedding(query)
-    results = index.query(vector=query_vector, top_k=4, include_metadata=True)
-    context = "\n\n".join([match['metadata']['text'] for match in results['matches']])
+def _stable_id(text: str, source: str, page: int, chunk_index: int) -> str:
+    """
+    Stable ID so re-indexing doesn't create duplicates.
+    """
+    h = hashlib.sha1(f"{source}|{page}|{chunk_index}|{text}".encode("utf-8")).hexdigest()
+    return f"{source}-p{page}-c{chunk_index}-{h[:10]}"
+
+def index_documents(chunks, batch_size: int = 50):
+    """
+    Upsert chunks into Pinecone in batches.
+    """
+    vectors_batch = []
+    total_indexed = 0
+
+    for i, chunk in enumerate(chunks):
+        text = getattr(chunk, "page_content", None) or str(chunk)
+        meta = getattr(chunk, "metadata", {}) or {}
+        source = meta.get("source", "unknown")
+        page = int(meta.get("page", 0) or 0)
+
+        vec = generate_embedding(text)
+        if vec is None:
+            logger.warning("Skipping chunk %s: embedding failed", i)
+            continue
+
+        vid = _stable_id(text=text, source=source, page=page, chunk_index=i)
+
+        vectors_batch.append({
+            "id": vid,
+            "values": vec,
+            "metadata": {
+                "text": text,
+                "source": source,
+                "page": page
+            }
+        })
+
+        if len(vectors_batch) >= batch_size:
+            index.upsert(vectors=vectors_batch)
+            total_indexed += len(vectors_batch)
+            vectors_batch = []
+
+    if vectors_batch:
+        index.upsert(vectors=vectors_batch)
+        total_indexed += len(vectors_batch)
+
+    logger.info("✅ Indexed %s vectors into Pinecone", total_indexed)
+    return total_indexed
+
+# -------------------------
+# RAG Answer
+# -------------------------
+def get_answer(query: str) -> str:
+    query = (query or "").strip()
+    if not query:
+        return "Veuillez écrire une question."
+
+    qv = generate_embedding(query)
+    if qv is None:
+        return (
+            "Désolé - impossible de calculer les embeddings localement. "
+            "Vérifiez l'installation: pip install -U sentence-transformers torch"
+        )
+
+    try:
+        results = index.query(vector=qv, top_k=4, include_metadata=True)
+        matches = results.get("matches", []) if isinstance(results, dict) else []
+    except Exception as e:
+        logger.exception("Pinecone query failed: %s", e)
+        return (
+            "Désolé - la recherche dans la base a échoué (Pinecone). "
+            "Vérifiez la clé Pinecone et l'index."
+        )
+
+    if not matches:
+        context = ""
+    else:
+        # Build context with sources
+        parts = []
+        for m in matches:
+            md = m.get("metadata", {}) or {}
+            txt = md.get("text", "")
+            src = md.get("source", "unknown")
+            pg = md.get("page", "?")
+            if txt:
+                parts.append(f"[Source: {src}, page {pg}]\n{txt}")
+        context = "\n\n".join(parts)
 
     instruction = (
         "Tu es Felah, un assistant agricole expert et amical.\n"
         "Réponds dans la langue de la question.\n"
         "Si c’est une salutation, réponds poliment.\n"
         "Sinon, donne une réponse claire, courte, structurée, pédagogique.\n"
+        "Si le contexte est vide ou insuffisant, dis-le et réponds au mieux sans inventer.\n"
         "Termine toujours par : 'N’hésitez pas à poser une autre question.'"
     )
 
     prompt = (
         f"{instruction}\n\n"
-        f"Contexte :\n{context}\n\n"
+        f"Contexte (extraits des documents) :\n{context}\n\n"
         f"Question : {query}\n"
         f"Réponse :"
     )
 
-    return model.generate_content(prompt).text
+    try:
+        return llm.generate_content(prompt).text
+    except Exception as e:
+        logger.exception("Gemini generation failed: %s", e)
+        return (
+            "Désolé - la génération de réponse a échoué (Gemini). "
+            "Vérifiez la clé GOOGLE_API_KEY et votre accès au modèle."
+        )
 
+# -------------------------
+# Optional: one-shot indexing helper
+# -------------------------
+def build_index():
+    pages = load_documents()
+    chunks = chunk_documents(pages)
+    index_documents(chunks)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import os
-# from dotenv import load_dotenv
-# # from sentence_transformers import SentenceTransformer
-# from PyPDF2 import PdfReader
-# import faiss
-# from langchain_community.vectorstores import FAISS
-# from langchain_community.embeddings import HuggingFaceEmbeddings
-
-
-# from langchain.docstore.document import Document
-# from langchain.text_splitter import RecursiveCharacterTextSplitter
-# import google.generativeai as genai
-
-# # Charger les variables d'environnement
-# load_dotenv()
-
-# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # depuis ton .env
-# genai.configure(api_key=GOOGLE_API_KEY)
-
-# EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-# DATA_DIR = "data"
-# VECTOR_DIR = "vector_store"
-
-# def load_documents():
-#     docs = []
-#     for filename in os.listdir(DATA_DIR):
-#         if filename.endswith(".pdf"):
-#             path = os.path.join(DATA_DIR, filename)
-#             reader = PdfReader(path)
-#             text = ""
-#             for page in reader.pages:
-#                 text += page.extract_text() or ""
-#             docs.append(text)
-#     return docs
-
-# def chunk_documents(texts):
-#     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-#     docs = []
-#     for text in texts:
-#         chunks = splitter.create_documents([text])
-#         docs.extend(chunks)
-#     return docs
-
-# def create_vector_store(docs):
-#     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-#     db = FAISS.from_documents(docs, embeddings)
-#     db.save_local(VECTOR_DIR)
-#     return db
-
-# def load_vector_store():
-#     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-#     db = FAISS.load_local(VECTOR_DIR, embeddings, allow_dangerous_deserialization=True)
-#     retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-#     return db, retriever
-
-# def generate_response(prompt):
-#     try:
-#         model = genai.GenerativeModel("gemini-1.5-flash")
-#         response = model.generate_content(prompt)
-#         return response.text
-#     except Exception as e:
-#         return f"Erreur Gemini API : {e}"
-
-# # def get_answer(query, retriever):
-# #     docs = retriever.get_relevant_documents(query)
-# #     context = "\n\n".join([doc.page_content for doc in docs])
-# #     prompt = f"Contexte:\n{context}\n\nQuestion: {query}\nRéponse:"
-# #     return generate_response(prompt)
-
-# def get_answer(query, retriever):
-#     docs = retriever.get_relevant_documents(query)
-#     context = "\n\n".join([doc.page_content for doc in docs])
-
-  
-#     instruction = (
-#     "Tu es Felah, un assistant agricole expert et amical.\n"
-#     "Avant de répondre, analyse l intention de l utilisateur :"
-#     "- Est-ce une salutation ? une remerciement ? une vraie question ?\n"
-#     "Adapte ta réponse en conséquence."
-#     "Réponds toujours en meme langue de quastion , si la question en francais répond en francais et si la question en arabe répond en arabe, de façon claire et adaptée à un agriculteur.\n"
-#     "Fais un retour à la ligne avant de répondre à la question.\n"
-#     "Si l'utilisateur te dit seulement 'bonjour', 'merci', ou te salue, réponds simplement avec une courte formule polie adaptée (ex : 'Bonjour ! Comment puis-je vous aider ?').\n"
-#     "Si l'utilisateur pose une vraie question, donne une réponse structurée, simple et pédagogique.\n"
-#     "il faut dire bonjour à chaque fois tu répond , seulement une fois au début de discussion , et après utilise d'autre formule de politesse"
-#     "Ne donne jamais de réponses inutiles ou trop longues pour des messages courts.\n"
-#     "Sois clair, structuré, sans jargon technique inutile.\n"
-#     "Si tu ne sais pas répondre précisément, dis-le honnêtement.\n"
-#     "Termine toujours ta réponse par une invitation à poser une autre question, sauf si c'est une salutation.\n"
-#      )
-
-
-#     prompt = (
-#         f"{instruction}\n\n"
-#         f"Contexte :\n{context}\n\n"
-#         f"Question : {query}\n"
-#         f"Réponse :"
-#     )
-
-#     return generate_response(prompt)
+if __name__ == "__main__":
+    # Example usage:
+    # 1) python rag_utils.py  -> builds index
+    # 2) then call get_answer("...") from your API
+    build_index()
+    print(get_answer("bonjour"))
