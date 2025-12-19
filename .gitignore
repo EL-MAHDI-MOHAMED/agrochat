@@ -13,6 +13,8 @@ env/
 ENV/
 env_chat/
 python=3.8/
+venv/
+vnv/
 
 # Dossiers système
 .DS_Store
