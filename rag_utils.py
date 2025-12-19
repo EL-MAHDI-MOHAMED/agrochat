@@ -82,37 +82,42 @@ def generate_embedding(text: str) -> Optional[List[float]]:
 # -------------------------
 # Pinecone
 # -------------------------
-if not PINECONE_API_KEY:
-    raise ValueError("Missing PINECONE_API_KEY in environment variables (.env)")
+_PINECONE_AVAILABLE = False
+index = None
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
+if PINECONE_API_KEY and PINECONE_API_KEY != "your_pinecone_key_here":
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        # Make sure embedding model is available so we know dimension
+        if not _ensure_local_model():
+             logger.warning("SentenceTransformers not available, skipping Pinecone init.")
+        else:
+             # Ensure dimension matches your Pinecone index
+            EMB_DIM = _LOCAL_EMB_DIM
+            if EMB_DIM == 768:
+                # Create index if missing
+                if INDEX_NAME not in pc.list_indexes().names():
+                    logger.info("Creating Pinecone index %s (dim=%s)", INDEX_NAME, EMB_DIM)
+                    try:
+                        pc.create_index(
+                            name=INDEX_NAME,
+                            dimension=EMB_DIM,
+                            metric="cosine",
+                            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not create index: {e}")
 
-# Make sure embedding model is available so we know dimension
-if not _ensure_local_model():
-    raise RuntimeError(
-        "SentenceTransformers is not available. Install it:\n"
-        "  pip install -U sentence-transformers torch\n"
-    )
+                index = pc.Index(INDEX_NAME)
+                _PINECONE_AVAILABLE = True
+            else:
+                 logger.warning(f"Embedding dimension mismatch: got {EMB_DIM}, expected 768.")
+    except Exception as e:
+        logger.warning(f"Failed to initialize Pinecone: {e}")
+else:
+    logger.warning("Pinecone API Key missing or default. RAG will be disabled.")
 
-# Ensure dimension matches your Pinecone index
-EMB_DIM = _LOCAL_EMB_DIM
-if EMB_DIM != 768:
-    raise RuntimeError(
-        f"Embedding dimension mismatch: got {EMB_DIM}. "
-        "Use a 768-dim model (e.g. paraphrase-multilingual-mpnet-base-v2 / all-mpnet-base-v2)."
-    )
-
-# Create index if missing
-if INDEX_NAME not in pc.list_indexes().names():
-    logger.info("Creating Pinecone index %s (dim=%s)", INDEX_NAME, EMB_DIM)
-    pc.create_index(
-        name=INDEX_NAME,
-        dimension=EMB_DIM,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1")
-    )
-
-index = pc.Index(INDEX_NAME)
 
 # -------------------------
 # PDF Load + Chunk
@@ -181,6 +186,10 @@ def index_documents(chunks, batch_size: int = 50):
     """
     Upsert chunks into Pinecone in batches.
     """
+    if not _PINECONE_AVAILABLE or not index:
+        logger.warning("Pinecone index not available, skipping indexing.")
+        return 0
+
     vectors_batch = []
     total_indexed = 0
 
@@ -191,6 +200,7 @@ def index_documents(chunks, batch_size: int = 50):
         page = int(meta.get("page", 0) or 0)
 
         vec = generate_embedding(text)
+        # ... rest of the function logic
         if vec is None:
             logger.warning("Skipping chunk %s: embedding failed", i)
             continue
@@ -227,26 +237,20 @@ def get_answer(query: str) -> str:
     if not query:
         return "Veuillez écrire une question."
 
-    qv = generate_embedding(query)
-    if qv is None:
-        return (
-            "Désolé - impossible de calculer les embeddings localement. "
-            "Vérifiez l'installation: pip install -U sentence-transformers torch"
-        )
+    matches = []
+    if _PINECONE_AVAILABLE and index:
+        qv = generate_embedding(query)
+        if qv:
+            try:
+                results = index.query(vector=qv, top_k=4, include_metadata=True)
+                matches = results.get("matches", []) if isinstance(results, dict) else []
+            except Exception as e:
+                logger.exception("Pinecone query failed: %s", e)
+        else:
+             logger.warning("Could not generate embedding for query.")
 
-    try:
-        results = index.query(vector=qv, top_k=4, include_metadata=True)
-        matches = results.get("matches", []) if isinstance(results, dict) else []
-    except Exception as e:
-        logger.exception("Pinecone query failed: %s", e)
-        return (
-            "Désolé - la recherche dans la base a échoué (Pinecone). "
-            "Vérifiez la clé Pinecone et l'index."
-        )
-
-    if not matches:
-        context = ""
-    else:
+    context = ""
+    if matches:
         # Build context with sources
         parts = []
         for m in matches:
@@ -257,6 +261,7 @@ def get_answer(query: str) -> str:
             if txt:
                 parts.append(f"[Source: {src}, page {pg}]\n{txt}")
         context = "\n\n".join(parts)
+
 
     instruction = (
         "Tu es Felah, un assistant agricole expert et amical.\n"

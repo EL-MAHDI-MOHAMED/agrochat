@@ -2,13 +2,11 @@ import os
 import sys
 
 # Vérification simple: prévenir l'utilisateur si l'environnement virtuel n'est pas activé
-if not os.getenv("VIRTUAL_ENV"):
-    print()
-    print("⚠️  L'environnement virtuel ne semble pas activé.")
-    print("Activez-le (PowerShell) : & .\\.venv\\Scripts\\Activate.ps1")
-    print("Puis installez les dépendances : pip install -r requirements.txt")
-    print("Ensuite lancez le serveur : uvicorn main:app --reload\n")
-    sys.exit(1)
+# (Désactivé pour Docker)
+# if not os.getenv("VIRTUAL_ENV"):
+#     print()
+#     print("⚠️  L'environnement virtuel ne semble pas activé.")
+#     sys.exit(1)
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
